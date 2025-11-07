@@ -1,0 +1,355 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+# --- 1. 设置模型参数 ---
+
+# 从 Froemke and Dan [9] 论文中获取的标准STDP拟合参数
+# 参见 图2B 的说明 
+A_plus = 1.01
+A_minus = -0.52
+tau_plus = 14.8  # ms
+tau_minus = 33.8 # ms
+
+# 根据论文中的公式 (8) 和 (9) 将STDP参数转换为模型参数 [cite: 103, 104, 106]
+tau_s = tau_plus        # 突触前痕迹时间常数 (ms) [cite: 106]
+tau_refr = tau_minus    # 突触后超极化时间常数 (ms) [cite: 104]
+
+# 假设 S_hat = 1.0 (nS)，如论文中所述 [cite: 109]
+S_hat = 1.0 
+
+# 根据公式 (8) 计算 U_refr 和 U_p [cite: 103]
+# 注意：这里的单位是相对的，与 A_plus 和 A_minus 的尺度一致
+U_refr = A_minus * (1.0/tau_s + 1.0/tau_refr) / S_hat
+U_p = (A_plus - A_minus) / S_hat
+
+print(f"模型参数计算完毕:")
+print(f"  tau_s = {tau_s:.2f} ms")
+print(f"  tau_refr = {tau_refr:.2f} ms")
+print(f"  U_p = {U_p:.3f}")
+print(f"  U_refr = {U_refr:.3f}")
+
+# 仿真时间步长
+dt = 0.01 # ms
+
+# --- 2. 核心模拟函数 ---
+def run_simulation(T, pre_spike_times, post_spike_times, alpha_att=0.0, Theta_u=0.0):
+    """
+    运行基于膜电位的BCM/STDP模型仿真
+    
+    参数:
+    T (float): 总仿真时长 (ms)
+    pre_spike_times (array): 突触前脉冲时间 (ms)
+    post_spike_times (array): 突触后脉冲时间 (ms)
+    alpha_att (float): 突触后脉冲衰减因子 (公式 4) 
+    Theta_u (float): LTP/LTD 阈值 (公式 5) [cite: 67]
+    
+    返回:
+    float: 总的权重变化 (delta_m)
+    """
+    n_steps = int(T / dt)
+    
+    # 状态变量
+    s = 0.0  # 突触前痕迹 [cite: 44]
+    u = 0.0  # 突触后膜电位 [cite: 52]
+    m = 0.0  # 突触权重 (我们只关心其变化量)
+    
+    # 预计算衰减因子
+    s_decay = np.exp(-dt / tau_s)
+    u_decay = np.exp(-dt / tau_refr)
+    
+    # 将脉冲时间转换为整数索引以便快速查找
+    pre_spike_indices = (pre_spike_times / dt).astype(int)
+    post_spike_indices = (post_spike_times / dt).astype(int)
+    
+    pre_spike_set = set(pre_spike_indices)
+    post_spike_set = set(post_spike_indices)
+
+    for i in range(n_steps):
+        
+        # 1. 连续更新 (衰减和LTD)
+        s *= s_decay
+        u *= u_decay
+        
+        # LTD 机制: 连续积分 
+        # dm/dt = (u(t) - Theta_u) * s(t) 
+        dm_ltd = (u - Theta_u) * s * dt
+        m += dm_ltd
+        
+        # 2. 检查突触前脉冲 (离散事件)
+        if i in pre_spike_set:
+            # 突触前痕迹 s 增加 S_hat [cite: 47, 51]
+            s += S_hat
+        
+        # 3. 检查突触后脉冲 (离散事件)
+        if i in post_spike_set:
+            # 获取脉冲前的 u(t) 值 
+            u_before_spike = u 
+            
+            # 计算衰减的 U_p (公式 4) 
+            if U_refr == 0:
+                att_factor = 1.0
+            else:
+                att_factor = (1.0 - alpha_att * (u_before_spike / U_refr))
+            
+            U_p_attenuated = U_p * att_factor
+            
+            # LTP 机制: 权重瞬时跳变 
+            dm_ltp = U_p_attenuated * s
+            m += dm_ltp
+            
+            # 重置 u(t) 到超极化电位 (公式 3) [cite: 54, 56]
+            u = U_refr
+            
+    return m
+
+# --- 3. 辅助函数：生成泊松脉冲 ---
+def generate_poisson_spikes(rate_hz, duration_ms):
+    """
+    生成泊松脉冲序列
+    rate_hz (float): 频率 (Hz)
+    duration_ms (float): 总时长 (ms)
+    """
+    if rate_hz == 0:
+        return np.array([])
+    
+    duration_sec = duration_ms / 1000.0
+    
+    # 期望的脉冲数量
+    n_spikes_expected = rate_hz * duration_sec
+    
+    # 从泊松分布中抽取实际的脉冲数量
+    n_spikes = np.random.poisson(n_spikes_expected)
+    
+    # 在总时长内均匀随机生成脉冲时间
+    spike_times_ms = np.random.uniform(0, duration_ms, n_spikes)
+    
+    return np.sort(spike_times_ms)
+
+# --- 4. 复现实验 1: STDP 窗口 (图 1) ---
+print("\n--- 正在运行复现 1: STDP 窗口 (图 1) ---")
+
+# 脉冲对的时间差 (t_post - t_pre) [cite: 90]
+delta_ts = np.arange(-50, 50.1, 2.5)
+weight_changes_stdp = []
+
+# 协议: 60 次配对, 1Hz 重复 
+n_pairings = 60
+pairing_interval_ms = 1000.0 # 1Hz = 1000ms
+
+# 在这个协议中, 衰减可以忽略 [cite: 95]
+alpha_att_fig1 = 0.0
+# 并且 Theta_u = 0 [cite: 94]
+Theta_u_fig1 = 0.0
+
+for dt_pair in delta_ts:
+    pre_spikes = []
+    post_spikes = []
+    
+    # 留出 100ms 的 buffer
+    t_start = 100.0 
+    
+    for i in range(n_pairings):
+        t_pair_start = t_start + i * pairing_interval_ms
+        
+        if dt_pair >= 0: # pre-post
+            pre_spikes.append(t_pair_start)
+            post_spikes.append(t_pair_start + dt_pair)
+        else: # post-pre
+            post_spikes.append(t_pair_start)
+            pre_spikes.append(t_pair_start - dt_pair) # dt_pair 是负数
+            
+    # 总仿真时间
+    T_total = t_start + n_pairings * pairing_interval_ms + 2 * abs(dt_pair) + 200.0
+    
+    delta_m = run_simulation(T_total, 
+                             np.array(pre_spikes), 
+                             np.array(post_spikes),
+                             alpha_att_fig1,
+                             Theta_u_fig1)
+    
+    # 记录 *平均每次配对* 的权重变化
+    weight_changes_stdp.append(delta_m / n_pairings)
+
+# 绘图
+plt.figure(figsize=(10, 6))
+plt.plot(delta_ts, weight_changes_stdp, 'o-', label='模型仿真')
+plt.title('复现图 1: STDP 窗口 ')
+plt.xlabel('t_post - t_pre (ms) [cite: 90]')
+plt.ylabel('相对权重变化 [cite: 78]')
+plt.axhline(0, color='black', lw=1.0)
+plt.axvline(0, color='black', lw=1.0)
+plt.grid(True, linestyle='--')
+plt.legend()
+plt.show()
+
+
+# --- 5. 复现实验 2: BCM 频率依赖性 (图 2B) ---
+print("\n--- 正在运行复现 2: BCM 频率依赖性 (图 2B) ---")
+
+# 协议: 突触前频率固定为 10Hz 
+pre_rate_hz = 10.0
+# 突触后频率变化 [cite: 150, 158]
+post_rates_hz = np.arange(0, 31, 2) 
+# 总时长 200 秒 
+sim_duration_ms = 200 * 1000.0 
+
+# 测试不同的衰减因子 
+alphas_to_test = [0.0, 0.4, 0.8] 
+
+# Theta_u = 0
+Theta_u_fig2 = 0.0
+
+plt.figure(figsize=(10, 6))
+
+for alpha in alphas_to_test:
+    print(f"  正在仿真: alpha_att = {alpha} ...")
+    weight_changes_bcm = []
+    
+    # 为每次 alpha 仿真生成一组固定的突触前脉冲
+    pre_spikes = generate_poisson_spikes(pre_rate_hz, sim_duration_ms)
+    
+    for post_rate in post_rates_hz:
+        # 生成对应的突触后脉冲
+        post_spikes = generate_poisson_spikes(post_rate, sim_duration_ms)
+        
+        delta_m = run_simulation(sim_duration_ms, 
+                                 pre_spikes, 
+                                 post_spikes,
+                                 alpha,
+                                 Theta_u_fig2)
+        
+        # 归一化: 计算每秒的平均权重变化
+        change_per_second = delta_m / (sim_duration_ms / 1000.0)
+        weight_changes_bcm.append(change_per_second)
+
+    # 绘制曲线
+    label_text = f"alpha_att = {alpha} "
+    plt.plot(post_rates_hz, weight_changes_bcm, 'o-', label=label_text)
+
+# 绘图
+plt.title('复现图 2B: BCM 频率依赖性 ')
+plt.xlabel('突触后频率, Hz ')
+plt.ylabel('相对权重变化 (单位/秒) [cite: 130]')
+plt.axhline(0, color='black', lw=1.0)
+plt.grid(True, linestyle='--')
+plt.legend()
+plt.show()
+
+print("\n所有复现已完成。")
+
+
+from matplotlib.colors import Normalize
+
+print("\n--- 正在运行复现 3: 脉冲三联体 (图 3B & 3C) ---")
+
+# --- 1. 定义仿真范围 ---
+# 坐标轴范围从 -30ms 到 +30ms
+t_range = np.arange(-30, 30.1, 2.0)
+n_points = len(t_range)
+
+# 创建2D网格来存储结果
+results_fig3B = np.zeros((n_points, n_points)) # 对应 alpha_att = 0
+results_fig3C = np.zeros((n_points, n_points)) # 对应 alpha_att = 0.8
+
+# --- 2. 运行三联体仿真 ---
+
+# 定义参考时间和总仿真时间
+t_ref = 100.0  # ms (所有脉冲都围绕这个时间)
+T_total = 200.0 # ms (确保所有脉冲和衰减都完成)
+
+# Theta_u = 0
+Theta_u_fig3 = 0.0
+
+for i, t1 in enumerate(t_range): # t1 是 y 轴
+    for j, t2 in enumerate(t_range): # t2 是 x 轴
+        
+        pre_spikes = []
+        post_spikes = []
+
+        if t1 == 0 or t2 == 0:
+            # 忽略坐标轴上的点，设为 0
+            results_fig3B[i, j] = 0
+            results_fig3C[i, j] = 0
+            continue
+            
+        if t1 > 0:
+            # 协议: 2 pre, 1 post (上半平面)
+            # t1 = t_post - t_pre1
+            # t2 = t_post - t_pre2
+            t_post = t_ref
+            t_pre1 = t_ref - t1
+            t_pre2 = t_ref - t2
+            pre_spikes = np.array([t_pre1, t_pre2])
+            post_spikes = np.array([t_post])
+            
+        else: # t1 < 0
+            # 协议: 1 pre, 2 post (下半平面)
+            # t1 = t_post1 - t_pre
+            # t2 = t_post2 - t_pre
+            t_pre = t_ref
+            t_post1 = t_ref + t1
+            t_post2 = t_ref + t2
+            pre_spikes = np.array([t_pre])
+            post_spikes = np.array([t_post1, t_post2])
+
+        # 运行仿真 (图 3B: alpha_att = 0)
+        delta_m_B = run_simulation(T_total, 
+                                   pre_spikes, 
+                                   post_spikes,
+                                   alpha_att=0.0,
+                                   Theta_u=Theta_u_fig3)
+        
+        # 运行仿真 (图 3C: alpha_att = 0.8)
+        delta_m_C = run_simulation(T_total, 
+                                   pre_spikes, 
+                                   post_spikes,
+                                   alpha_att=0.8,
+                                   Theta_u=Theta_u_fig3)
+
+        results_fig3B[i, j] = delta_m_B
+        results_fig3C[i, j] = delta_m_C
+
+print("  三联体仿真计算完成。")
+
+# --- 3. 绘制热图 (Heatmaps) ---
+
+# 归一化颜色条
+# 找到两个图中的最大绝对值，使它们的颜色条一致
+vmax_B = np.max(np.abs(results_fig3B))
+vmax_C = np.max(np.abs(results_fig3C))
+vmax_abs = max(vmax_B, vmax_C)
+norm = Normalize(vmin=-vmax_abs, vmax=vmax_abs)
+
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+
+# 绘图范围
+extent = [t_range.min(), t_range.max(), t_range.min(), t_range.max()]
+
+# 图 3B (alpha_att = 0)
+im1 = ax1.imshow(results_fig3B, origin='lower', extent=extent, 
+                 cmap='RdBu_r', norm=norm)
+ax1.set_title(f'复现图 3B: 基础模型 (alpha_att = 0)')
+ax1.set_xlabel('t2 in ms')
+ax1.set_ylabel('t1 in ms')
+ax1.axhline(0, color='black', lw=1.0)
+ax1.axvline(0, color='black', lw=1.0)
+ax1.text(0.05, 0.95, '2 pre, 1 post', transform=ax1.transAxes, 
+         ha='left', va='top', fontsize=12)
+ax1.text(0.95, 0.05, '1 pre, 2 post', transform=ax1.transAxes, 
+         ha='right', va='bottom', fontsize=12)
+
+# 图 3C (alpha_att = 0.8)
+im2 = ax2.imshow(results_fig3C, origin='lower', extent=extent, 
+                 cmap='RdBu_r', norm=norm)
+ax2.set_title(f'复现图 3C: 带衰减的模型 (alpha_att = 0.8)')
+ax2.set_xlabel('t2 in ms')
+ax2.set_ylabel('t1 in ms')
+ax2.axhline(0, color='black', lw=1.0)
+ax2.axvline(0, color='black', lw=1.0)
+
+# 添加颜色条
+fig.colorbar(im1, ax=[ax1, ax2], orientation='vertical', 
+             label='相对权重变化', shrink=0.75)
+
+plt.tight_layout()
+plt.show()
